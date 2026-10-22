@@ -19,6 +19,7 @@ matter more than speed — please read this guide before opening a pull request.
 - [Local Development](#local-development)
 - [Coding Standards](#coding-standards)
 - [Testing](#testing)
+- [Releasing contracts](#releasing-contracts)
 - [Pull Request Process](#pull-request-process)
 - [Commit Messages](#commit-messages)
 - [Reporting Bugs & Security Issues](#reporting-bugs--security-issues)
@@ -190,6 +191,29 @@ This is intended to track the same set of checks CI enforces in
 
 Every behavioral change **must** come with tests.
 
+### Local artifacts and repository hygiene
+
+Soroban `test_snapshots/` directories are generated local artifacts, not test
+fixtures. Tests may create or rewrite them, but do not commit them. All such
+directories are ignored, along with `.soroban-amm.deploy.env` and
+`optimized-artifacts/`. To stop tracking an accidentally committed artifact
+without deleting your local copy, use `git rm -r --cached -- <path>` and commit
+the removal.
+
+CI runs `bash scripts/check_repo_hygiene.sh tracked` before building/testing and
+`bash scripts/check_repo_hygiene.sh clean` afterward. The first rejects tracked
+snapshots, `.DS_Store`, `__pycache__` and `.pyc` artifacts; the second requires
+`git status --porcelain` to be empty, including unignored new files. Tests must
+not depend on or rewrite tracked generated output. Run the guard's regression
+tests with `bash scripts/check_repo_hygiene.test.sh`.
+
+For an existing clone, `git gc` can compact Git's object storage without
+rewriting history. It cannot remove snapshot blobs still reachable in old
+commits, and it does not delete ignored local snapshots. Untracking snapshots
+therefore reduces future checkouts and diffs, but does not promise an immediate
+reduction of historical clone size. Do not rewrite published history to purge
+these artifacts.
+
 - **Unit tests** live alongside each contract's `src/`.
 - **Property-based tests** for pool invariants (swap, fee accounting, liquidity
   math) live in `amm-fuzz` — extend these when touching core AMM math.
@@ -210,6 +234,34 @@ cargo test -p factory
 For security-sensitive changes (swap math, fee logic, authorization, flash
 loans), describe in your PR how you verified correctness and what invariants you
 checked. See [`AUDIT.md`](AUDIT.md) for the security properties we track.
+
+---
+
+## Releasing contracts
+
+Release changes through a pull request to `main`. The PR must add a dated
+Keep a Changelog section for the exact version heading (for example,
+`## [v1.2.3] - 2026-10-21`) and update the `[Unreleased]` section as needed.
+The release workflow uses only that version's section as the GitHub release
+body; it does not modify or upload a temporary changelog.
+
+After the PR is merged, create and push a `v*` tag on the merged commit. The
+workflow confirms that commit is reachable from `main`, builds with the pinned
+Rust toolchain and locked Cargo dependencies, runs the Rust and ABI/documentation
+gates, and checks the exact deployable WASM set. It then creates a draft release,
+downloads and verifies the draft assets, and runs the testnet e2e smoke suite
+against those downloaded WASM files. The release is published only if the smoke
+test passes. The published assets include the contract WASM files,
+`sha256sums.txt`, and `manifest.json`; GitHub build provenance is attested for
+the WASM files.
+
+To validate a release candidate from **Actions → Release contracts → Run
+workflow**, provide the version tag and leave **dry_run** enabled. The workflow
+runs the same gates, creates an unpublished draft, downloads and verifies its
+assets, and runs the testnet smoke test against them. It leaves the draft
+unpublished and uploads the assets and notes as a workflow artifact. Use a
+commit reachable from `main` with its version section in `CHANGELOG.md`. Link
+the Actions run and its artifact from the release pull request.
 
 ---
 

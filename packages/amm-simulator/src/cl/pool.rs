@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Fixed-point scale of the fee-growth accumulators, as in the contract
-/// (`lp_fee * 1_000_000 / active_liquidity`).
-pub const FEE_GROWTH_SCALE: i128 = 1_000_000;
+/// (Q64 wide scale, issue #1098).
+pub const FEE_GROWTH_SCALE: i128 = 1_i128 << 64;
 
 /// Tick structure holding liquidity and fee growth data.
 ///
@@ -230,7 +230,8 @@ impl ClPoolState {
             return Err(SimulationError::TickOutOfRange { tick });
         }
         self.ensure_repriceable()?;
-        self.sqrt_price_x96 = swap_math::tick_to_sqrt_price_x96(tick) as i128;
+        let sp = swap_math::tick_to_sqrt_price_x96(tick);
+        self.sqrt_price_x96 = i128::try_from(sp).map_err(|_| SimulationError::PriceOverflow)?;
         self.current_tick = tick;
         Ok(())
     }
@@ -437,7 +438,12 @@ fn pending_fees(position: &Position, inside_a: i128, inside_b: i128) -> (i128, i
     let delta_b = inside_b - position.fee_growth_inside_b_snapshot;
     let owed = |delta: i128| {
         if delta > 0 {
-            position.liquidity * delta / FEE_GROWTH_SCALE
+            swap_math::mul_div(
+                position.liquidity as u128,
+                delta as u128,
+                FEE_GROWTH_SCALE as u128,
+            )
+            .unwrap_or(0) as i128
         } else {
             0
         }
@@ -505,8 +511,12 @@ mod tests {
         assert!(p.initialize(-1).is_err());
         let min = swap_math::tick_to_sqrt_price_x96(MIN_TICK) as i128;
         assert!(p.initialize(min - 1).is_err());
-        let max = swap_math::tick_to_sqrt_price_x96(MAX_TICK) as i128;
-        assert!(p.initialize(max + 1).is_err());
+        assert!(p.initialize_at_tick(MIN_TICK - 1).is_err());
+        assert!(p.initialize_at_tick(MAX_TICK + 1).is_err());
+        assert!(matches!(
+            p.initialize_at_tick(MAX_TICK),
+            Err(SimulationError::PriceOverflow)
+        ));
     }
 
     #[test]

@@ -275,6 +275,10 @@ a representative call sequence and asserts every pool event carries the leading
 | `rate_updated` | — | `(campaign_id: u64, new_rate: i128)` |
 | `leftover_recovered` | — | `(campaign_id: u64, recipient: Address, leftover: i128)` |
 | `reward_distributed` | — | `(campaign_id: u64, provider: Address, amount: i128, dist_id: u64)` |
+| `staked` | — | `(campaign_id: u64, provider: Address, amount: i128, total_staked: i128)` |
+| `unstaked` | — | `(campaign_id: u64, provider: Address, amount: i128, total_staked: i128)` |
+
+`staked` and `unstaked` (issue #1115) are emitted by the stake-based reward model; `total_staked` is the campaign's total after the change. See [incentive-campaigns.md](incentive-campaigns.md).
 
 ### TWAL consumer — `contracts/twal_consumer/src/lib.rs`
 
@@ -324,6 +328,13 @@ a representative call sequence and asserts every pool event carries the leading
 | Event | Topics | Payload |
 |---|---|---|
 | `migrated` | `provider` | `(v2_shares: i128, deposited_a: i128, deposited_b: i128, position_token_id: Option<u64>, leftover_a: i128, leftover_b: i128)` |
+| `factory_set` | — | `(factory: Address)` |
+| `default_pair_set` | — | `(v2_pool: Address, v3_pool: Address)` |
+| `paused` | — | `(admin: Address)` |
+| `unpaused` | — | `(admin: Address)` |
+| `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
+| `admin_nominated` | — | `(admin: Address, new_admin: Address)` |
+| `admin_changed` | — | `(new_admin: Address)` |
 
 ### BatchRouter — `contracts/batch_router/src/lib.rs`
 
@@ -386,6 +397,11 @@ on-wire data shape `(schema_version, payload)`.
 | `emergency_withdraw` | — | `(staker: Address, amount: i128)` |
 | `boost_exp` | — | `(staker: Address, previous_boost: i128, settled_boost: i128)` |
 | `rewards_reconciled` | — | `(admin: Address, old_undistributed: i128, old_owed: i128, new_undistributed: i128, new_owed: i128)` |
+| `initialized` | — | `(lp_token: Address, reward_token: Address, admin: Address, min_boost: i128, max_boost: i128, min_lock_duration: u64, max_lock_duration: u64)` |
+| `staker_index_migrated` | — | `(registered: u32)` |
+| `admin_nominated` | — | `(admin: Address, new_admin: Address)` |
+| `admin_changed` | — | `(new_admin: Address)` |
+| `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
 
 `boost_exp` (issue #699) is emitted by `settle_boost`/`settle_boost_batch`
 only when a lock's stored boost is actually reduced from a stale
@@ -395,6 +411,23 @@ post-expiry value down to `min_boost` -- it does not fire on a no-op call
 `rewards_reconciled` (issue #1045) is emitted once per completed
 `reconcile_reward_accounting` run, with the undistributed/owed counters
 before and after the repair.
+
+`initialized` (issue #1114) is emitted by both `initialize` and
+`initialize_with_boost_config` and carries the stored configuration, so a
+deployer can compare it with `get_config()` and with what was intended.
+`initialize` takes no `require_auth` (the admin may be a contract that cannot
+sign for itself), so this event and `get_config` are how a wrong or
+front-run initialization is detected.
+
+`staker_index_migrated` (issue #1113) is emitted once, by the last page of
+`migrate_staker_index`, with the number of stakers in the registry.
+
+`admin_nominated`, `admin_changed` and `upgraded` were the last staking events
+published without the leading `schema_version`; as of issue #1114 they go
+through `emit_versioned_event!` like the rest, so an indexer reads
+`(schema_version, payload)` for every staking event. This is a wire-format
+change for those three topics: a consumer that decoded them as a bare payload
+must now read the leading version first.
 
 ### Consumer rules
 
@@ -453,10 +486,21 @@ by `set_source_weight`. It has since been migrated onto the versioned scheme
 
 | Event | Topics | Payload |
 |---|---|---|
+| `init` | — | `(admin: Address, max_staleness_seconds: u64, max_deviation_bps: u32)` |
+| `paused` | — | `(admin: Address)` |
+| `unpaused` | — | `(admin: Address)` |
+| `src_add` | — | `(pair: PairKey, source: Address, source_type: OracleSourceType, weight: u32)` |
+| `src_rm` | — | `(pair: PairKey, source: Address, force: bool)` |
+| `pair_rm` | — | `(pair: PairKey)` |
+| `pair_cfg` | — | `(pair: PairKey, config: PairConfig)` |
+| `legacy` | — | `(pair: PairKey, moved: u32)` |
+| `src_migr` | — | `(migrated: bool)` |
+| `stale` | — | `(max_staleness_seconds: u64)` |
+| `deviation` | — | `(max_deviation_bps: u32)` |
 | `stale_src` | — | `(stale_sources: Vec<Address>)` |
 | `deviant` | — | `(deviant_sources: Vec<Address>)` |
 | `price` | — | `(token_a: Address, token_b: Address, price: i128, confidence: u32)` |
-| `src_wt` | — | `(source: Address, old_weight: u32, new_weight: u32)` |
+| `src_wt` | — | `(pair: PairKey, source: Address, old_weight: u32, new_weight: u32)` |
 
 ## Update (#812)
 
@@ -638,6 +682,15 @@ count. Events marked unversioned carry their payload without the
 | `swap` | 2 | `zero_for_one`, `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `price_upd` | 3 | `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `swap_out` | 2 | `zero_for_one`, `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
+| `oracle_set` | 1 | `old_oracle`, `new_oracle` | v1 |
+| `position_nft_set` | 1 | `old_position_nft`, `new_position_nft` | v1 |
+| `max_oracle_deviation_set` | 1 | `old_deviation_bps`, `new_deviation_bps` | v1 |
+| `pause` | 1 | `admin` | v1 |
+| `unpause` | 1 | `admin` | v1 |
+| `admin_nominated` | 1 | `admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `protocol_fee_set` | 1 | `bps`, `recipient` | v1 |
+| `protocol_fees_withdrawn` | 1 | `recipient`, `accrued_a`, `accrued_b` | v1 |
 
 ### `dex_aggregator`
 
@@ -670,14 +723,21 @@ count. Events marked unversioned carry their payload without the
 | `global_fee_set` | 1 | `protocol_fee_bps`, `offset`, `updated` | v1 |
 | `fees_swept` | 1 | `treasury`, `token`, `offset`, `pools_swept`, `total_collected` | v1 |
 | `creation_fee_paid` | 1 | `caller`, `fee_amount` | v1 |
+| `initialized` | 1 | `admin`, `amm_wasm_hash`, `token_wasm_hash` | v1 |
+| `cl_wasm_updated` | 1 | `old_wasm_hash`, `new_wasm_hash` | v1 |
+| `rate_limit_set` | 1 | `old_limit`, `new_limit` | v1 |
 
 ### `governance`
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `initialized` | 1 | `admin`, `amm_pool`, `lp_token`, `voting_period_secs`, `timelock_secs`, `quorum_bps`, `min_proposer_stake_bps` | v1 |
 | `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
 | `admin_changed` | 1 | `new_admin` | v1 |
 | `upgraded` | 1 | `new_wasm_hash` | v1 |
+| `quorum_decay_set` | 1 | `old_rate_bps_per_day`, `new_rate_bps_per_day` | v1 |
+| `min_stake_set` | 1 | `old_min_proposer_stake_bps`, `new_min_proposer_stake_bps` | v1 |
+| `timelock_set` | 1 | `old_timelock_secs`, `new_timelock_secs` | v1 |
 | `proposed` | 1 | `id`, `proposer`, `kind`, `vote_end`, `snapshot_ledger` | v1 |
 | `voted` | 1 | `proposal_id`, `voter`, `choice`, `voting_power` | v1 |
 | `executed` | 1 | `proposal_id`, `kind` | v1 |
@@ -685,7 +745,7 @@ count. Events marked unversioned carry their payload without the
 | `vote_unlocked` | 2 | `proposal_id`, `locked` | v1 |
 | `delegated` | 1 | `from`, `to` | v1 |
 | `undelegated` | 1 | `from` | v1 |
-| `veto_multisig_set` | 1 | `multisig` | v1 |
+| `veto_multisig_set` | 1 | `old_multisig`, `new_multisig` | v1 |
 | `vetoed` | 1 | `proposal_id`, `multisig`, `now`, `discussion_end` | v1 |
 
 ### `incentive_campaigns`
@@ -698,6 +758,8 @@ count. Events marked unversioned carry their payload without the
 | `rate_updated` | 1 | `campaign_id`, `new_rate` | v1 |
 | `leftover_recovered` | 1 | `campaign_id`, `recipient`, `leftover` | v1 |
 | `reward_distributed` | 1 | `campaign_id`, `provider`, `pending`, `dist_id` | v1 |
+| `staked` | 1 | `campaign_id`, `provider`, `amount`, `total_staked` | v1 |
+| `unstaked` | 1 | `campaign_id`, `provider`, `amount`, `total_staked` | v1 |
 
 ### `oracle_aggregator`
 
@@ -744,6 +806,10 @@ count. Events marked unversioned carry their payload without the
 |---|---|---|---|
 | `pause` | 1 | `admin` | v1 |
 | `unpause` | 1 | `admin` | v1 |
+| `route` | 1 | `trader`, `path`, `amount_in`, `amount_out`, `hops` | v1 |
+| `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 
 ### `staking`
 
@@ -753,9 +819,9 @@ count. Events marked unversioned carry their payload without the
 | `rewards_added` | 1 | `admin`, `received` | v1 |
 | `paused` | 1 | `admin` | v1 |
 | `unpaused` | 1 | `admin` | v1 |
-| `admin_nominated` | 1 | `admin`, `new_admin` | unversioned |
-| `admin_changed` | 1 | `new_admin` | unversioned |
-| `upgraded` | 1 | `new_wasm_hash` | unversioned |
+| `admin_nominated` | 1 | `admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `staked` | 1 | `staker`, `amount`, `new_boost`, `new_expiry` | v1 |
 | `unstaked` | 1 | `staker`, `amount`, `rewards` | v1 |
 | `emergency_mode` | 1 | `admin`, `enabled` | v1 |
@@ -766,6 +832,8 @@ count. Events marked unversioned carry their payload without the
 | `rewards_clamped` | 1 | `new_rewards`, `pool_balance` | v1 |
 | `rewards_updated` | 1 | `distributable` | v1 |
 | `claimed` | 1 | `staker`, `pending` | v1 |
+| `initialized` | 1 | `lp_token`, `reward_token`, `admin`, `min_boost`, `max_boost`, `min_lock_duration`, `max_lock_duration` | v1 |
+| `staker_index_migrated` | 1 | `registered` | v1 |
 
 ### `token`
 
@@ -774,7 +842,15 @@ count. Events marked unversioned carry their payload without the
 | `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
 | `admin_transferred` | 1 | `new_admin` | v1 |
 | `upgraded` | 1 | `new_wasm_hash` | v1 |
-| `transfer` | 2 | `to`, `amount` | v1 |
+| `transfer` | 3 | `amount` | unversioned |
+| `initialized` | 1 | `admin`, `name`, `symbol`, `decimals` | v1 |
+| `approve` | 3 | `amount`, `live_until_ledger` | unversioned |
+| `mint` | 3 | `amount` | unversioned |
+| `burn` | 2 | `amount` | unversioned |
+| `set_locker` | 1 | `admin`, `locker` | v1 |
+| `lock` | 1 | `holder`, `locker`, `amount`, `new_entry`, `new_locked` | v1 |
+| `unlock` | 1 | `holder`, `locker`, `amount`, `new_entry`, `new_locked` | v1 |
+| `migrate_legacy_lock` | 1 | `holder`, `locker`, `amount`, `new_entry`, `grand_total` | v1 |
 
 ### `twal_consumer`
 
@@ -796,5 +872,12 @@ count. Events marked unversioned carry their payload without the
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
 | `migrated` | 2 | `v2_shares`, `deposited_a`, `deposited_b`, `position_token_id`, `leftover_a`, `leftover_b` | v1 |
+| `factory_set` | 1 | `factory` | v1 |
+| `default_pair_set` | 1 | `v2_pool`, `v3_pool` | v1 |
+| `paused` | 1 | `admin` | v1 |
+| `unpaused` | 1 | `admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
+| `admin_nominated` | 1 | `admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
 
 <!-- END GENERATED EVENT FIELD CATALOGUE -->

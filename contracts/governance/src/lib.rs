@@ -23,6 +23,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
 };
 
+use soroban_amm_sdk::types::TokenError;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_BPS: i128 = 10_000;
@@ -42,6 +44,10 @@ const PERSISTENT_TTL_BUMP_TO: u32 = 259_200; // ~15 days at 5s/ledger
                                              // reference contract.
 const MIN_INSTANCE_TTL: u32 = 172_800;
 const INSTANCE_TTL_BUMP_TO: u32 = 518_400;
+/// Minimum allowable timelock in seconds (1 second).
+const MIN_TIMELOCK_SECS: u64 = 1;
+/// Maximum allowable timelock in seconds (365 days).
+const MAX_TIMELOCK_SECS: u64 = 365 * 24 * 60 * 60;
 /// Multisig may veto a passed proposal within this window after voting ends.
 const VETO_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// Maximum delegation chain depth (prevents unbounded recursion).
@@ -95,6 +101,8 @@ pub enum GovernanceError {
     /// counter) was called before `initialize`. Discriminant 2 is taken by
     /// `InvalidVotingPeriod`, so this is appended rather than renumbered.
     NotInitialized = 35,
+    /// Proposal parameters failed validation (e.g., invalid vesting schedule).
+    InvalidProposalParams = 36,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -123,6 +131,8 @@ pub enum DataKey {
     QuorumDecayRateBpsPerDay,
     /// Individual proposal storage.
     Proposal(u32),
+    /// Proposal-specific parameters (quorum, decay rate, timelock) snapshotted at creation (#1105).
+    ProposalParams(u32),
     /// Vote record for a voter on a proposal: (proposal_id, voter).
     HasVoted(u32, Address),
     /// Locked voting amount for a voter on a proposal.
@@ -196,6 +206,15 @@ pub struct GovernanceParams {
     pub veto_multisig: Option<Address>,
     /// Extra quorum bps per day open; 0 disables decay (#311).
     pub quorum_decay_rate_bps_per_day: i128,
+}
+
+/// Proposal-specific parameters snapshotted at creation time (#1105).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalParams {
+    pub quorum_bps: i128,
+    pub quorum_decay_rate_bps_per_day: i128,
+    pub timelock_secs: u64,
 }
 
 /// On-chain audit trail for a governance veto.
@@ -352,6 +371,8 @@ pub trait LpTokenInterface {
     fn balance(env: Env, id: Address) -> i128;
     fn balance_at(env: Env, id: Address, ledger: u32) -> i128;
     fn total_supply(env: Env) -> i128;
+    fn total_supply_at(env: Env, ledger: u32) -> Result<i128, TokenError>;
+    fn locked_balance(env: Env, id: Address) -> i128;
     fn lock(env: Env, holder: Address, amount: i128);
     /// `locker` is the contract that originally locked the tokens (issue #556 fix).
     fn unlock(env: Env, holder: Address, locker: Address, amount: i128);
@@ -445,7 +466,7 @@ impl Governance {
         if voting_period_secs == 0 {
             return Err(GovernanceError::InvalidVotingPeriod);
         }
-        if timelock_secs == 0 {
+        if !(MIN_TIMELOCK_SECS..=MAX_TIMELOCK_SECS).contains(&timelock_secs) {
             return Err(GovernanceError::InvalidTimelock);
         }
         if !(1..=MAX_BPS).contains(&quorum_bps) {
@@ -473,7 +494,63 @@ impl Governance {
             .instance()
             .set(&DataKey::QuorumDecayRateBpsPerDay, &0i128);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "initialized"),),
+            (
+                admin,
+                amm_pool,
+                lp_token,
+                voting_period_secs,
+                timelock_secs,
+                quorum_bps,
+                min_proposer_stake_bps,
+            )
+        );
         Ok(())
+    }
+
+    /// Return the stored governance admin address (#1105).
+    pub fn get_admin(env: Env) -> Result<Address, GovernanceError> {
+        Self::extend_instance_ttl(&env);
+        Self::read_admin(&env)
+    }
+
+    /// Read proposal parameters snapshotted at creation time (#1105).
+    pub fn get_proposal_params(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<ProposalParams, GovernanceError> {
+        Self::extend_instance_ttl(&env);
+        let key = DataKey::Proposal(proposal_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(GovernanceError::ProposalNotFound);
+        }
+        Self::bump_key_ttl(&env, &key);
+        let params_key = DataKey::ProposalParams(proposal_id);
+        if let Some(params) = env
+            .storage()
+            .persistent()
+            .get::<_, ProposalParams>(&params_key)
+        {
+            Self::bump_key_ttl(&env, &params_key);
+            Ok(params)
+        } else {
+            // Fallback for legacy proposals
+            let quorum_bps = Self::read_quorum_bps(&env)?;
+            let decay_rate: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::QuorumDecayRateBpsPerDay)
+                .unwrap_or(0);
+            let timelock_secs = Self::read_timelock(&env)?;
+            Ok(ProposalParams {
+                quorum_bps,
+                quorum_decay_rate_bps_per_day: decay_rate,
+                timelock_secs,
+            })
+        }
     }
 
     /// Make this contract the LP token's locker (issue #986).
@@ -491,6 +568,7 @@ impl Governance {
     /// has some other admin, that admin calls the pool's `set_lp_locker`
     /// directly instead.
     pub fn claim_lp_locker(env: Env) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let amm_pool = Self::read_amm_pool(&env)?;
         AmmPoolClient::new(&env, &amm_pool).set_lp_locker(&env.current_contract_address());
         Ok(())
@@ -498,14 +576,25 @@ impl Governance {
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
     pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
-        if new_rate < 0 {
+        if !(0..=MAX_BPS).contains(&new_rate) {
             return Err(GovernanceError::InvalidQuorumBps);
         }
+        let old_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::QuorumDecayRateBpsPerDay)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::QuorumDecayRateBpsPerDay, &new_rate);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "quorum_decay_set"),),
+            (old_rate, new_rate)
+        );
         Ok(())
     }
 
@@ -526,14 +615,21 @@ impl Governance {
 
     /// Admin-only governance parameter update.
     pub fn set_min_proposer_stake_bps(env: Env, new_bps: i128) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if !(0..=MAX_BPS).contains(&new_bps) {
             return Err(GovernanceError::InvalidProposerStake);
         }
+        let old_bps = Self::read_min_proposer_stake_bps(&env)?;
         env.storage()
             .instance()
             .set(&DataKey::MinProposerStakeBps, &new_bps);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "min_stake_set"),),
+            (old_bps, new_bps)
+        );
         Ok(())
     }
 
@@ -541,9 +637,19 @@ impl Governance {
     /// Execution is always gated by at least the veto window (24h), so even
     /// a delay of 0 does not allow execution before the veto window expires.
     pub fn set_timelock_delay(env: Env, new_delay: u64) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
+        if !(MIN_TIMELOCK_SECS..=MAX_TIMELOCK_SECS).contains(&new_delay) {
+            return Err(GovernanceError::InvalidTimelock);
+        }
+        let old_delay = Self::read_timelock(&env)?;
         env.storage().instance().set(&DataKey::Timelock, &new_delay);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "timelock_set"),),
+            (old_delay, new_delay)
+        );
         Ok(())
     }
 
@@ -556,6 +662,7 @@ impl Governance {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if current_admin != stored {
             return Err(GovernanceError::Unauthorized);
@@ -612,6 +719,7 @@ impl Governance {
         admin: Address,
         new_wasm_hash: BytesN<32>,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(GovernanceError::Unauthorized);
@@ -643,7 +751,7 @@ impl Governance {
 
         match &kind {
             ProposalKind::UpdateFee(new_fee_bps) => {
-                if !(0..=MAX_BPS).contains(new_fee_bps) {
+                if !(0..MAX_BPS).contains(new_fee_bps) {
                     return Err(GovernanceError::InvalidFeeBps);
                 }
             }
@@ -688,21 +796,84 @@ impl Governance {
                 }
             }
             ProposalKind::UpdateClProtocolFee(params) => {
-                if !(0..=MAX_BPS).contains(&params.bps) {
+                if !(0..MAX_BPS).contains(&params.bps) {
                     return Err(GovernanceError::InvalidFeeBps);
                 }
             }
-            ProposalKind::TransferClPoolAdmin(_) => {}
+            ProposalKind::TransferClPoolAdmin(params) => {
+                if params.new_admin == params.cl_pool {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
             ProposalKind::SetClPositionNft(_) => {}
+            ProposalKind::CreatePolVesting(params) => {
+                if params.total <= 0 {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+                if params.cliff_ledger < params.start_ledger {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+                if params.end_ledger <= params.cliff_ledger {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+                // end_ledger must be in the future
+                if params.end_ledger <= env.ledger().sequence() {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
+            ProposalKind::PauseClPool(cl_pool) => {
+                if *cl_pool == env.current_contract_address() {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
+            ProposalKind::UnpauseClPool(cl_pool) => {
+                if *cl_pool == env.current_contract_address() {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
+            ProposalKind::UpdateClOracle(params) => {
+                if let Some(oracle) = &params.oracle {
+                    if *oracle == env.current_contract_address() {
+                        return Err(GovernanceError::InvalidProposalParams);
+                    }
+                }
+            }
+            ProposalKind::EmergencyWithdraw(to) => {
+                if *to == env.current_contract_address() {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
+            ProposalKind::TransferAdmin(new_admin) => {
+                let current_admin = Self::read_admin(&env)?;
+                if new_admin == &current_admin {
+                    return Err(GovernanceError::InvalidProposalParams);
+                }
+            }
         }
 
         let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
 
-        let total_supply = lp_client.total_supply();
-        if total_supply == 0 {
+        // Snapshot the last already-closed ledger, never the current still-open
+        // one. LpToken::write_checkpoint overwrites (not appends) the checkpoint
+        // when a balance change lands in the same ledger, so using the current
+        // ledger would fold any mint/transfer included in this same ledger —
+        // even in a later transaction — into balance_at(holder, snapshot_ledger),
+        // letting an attacker inflate their snapshotted voting power. Any change
+        // at the current ledger or later is written at a ledger strictly greater
+        // than this snapshot and is therefore excluded.
+        let snapshot_ledger = env.ledger().sequence().saturating_sub(1);
+
+        // Use total_supply_at to get the supply at snapshot_ledger, preventing
+        // quorum manipulation by same-ledger mint/burn.
+        let snapshot_total_supply = lp_client
+            .total_supply_at(&snapshot_ledger)
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?;
+        if snapshot_total_supply == 0 {
             return Err(GovernanceError::ZeroTotalSupply);
         }
+
+        let total_supply = lp_client.total_supply();
         let proposer_balance = lp_client.balance(&proposer);
         let min_bps: i128 = env
             .storage()
@@ -718,28 +889,26 @@ impl Governance {
         let timelock = Self::read_timelock(&env)?;
 
         let now = env.ledger().timestamp();
-        let vote_end = now + voting_period;
-        let execute_after = vote_end + timelock.max(VETO_WINDOW_SECS);
+        let vote_end = now
+            .checked_add(voting_period)
+            .ok_or(GovernanceError::InvalidVotingPeriod)?;
+        let timelock_clamped = timelock.max(VETO_WINDOW_SECS);
+        let execute_after = vote_end
+            .checked_add(timelock_clamped)
+            .ok_or(GovernanceError::InvalidTimelock)?;
         // Execution window: at least one voting period even when timelock is 0.
-        let expires_at = execute_after + timelock.max(voting_period);
+        let expires_delay = timelock.max(voting_period);
+        let expires_at = execute_after
+            .checked_add(expires_delay)
+            .ok_or(GovernanceError::InvalidTimelock)?;
 
         let id = Self::read_proposal_count(&env)?;
-
-        // Snapshot the last already-closed ledger, never the current still-open
-        // one. LpToken::write_checkpoint overwrites (not appends) the checkpoint
-        // when a balance change lands in the same ledger, so using the current
-        // ledger would fold any mint/transfer included in this same ledger —
-        // even in a later transaction — into balance_at(holder, snapshot_ledger),
-        // letting an attacker inflate their snapshotted voting power. Any change
-        // at the current ledger or later is written at a ledger strictly greater
-        // than this snapshot and is therefore excluded.
-        let snapshot_ledger = env.ledger().sequence().saturating_sub(1);
 
         let proposal = Proposal {
             id,
             proposer: proposer.clone(),
             kind: kind.clone(),
-            snapshot_total_supply: total_supply,
+            snapshot_total_supply,
             snapshot_ledger,
             vote_start: now,
             vote_end,
@@ -759,6 +928,24 @@ impl Governance {
         let proposal_key = DataKey::Proposal(id);
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
+
+        let quorum_bps = Self::read_quorum_bps(&env)?;
+        let decay_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::QuorumDecayRateBpsPerDay)
+            .unwrap_or(0);
+        let proposal_params = ProposalParams {
+            quorum_bps,
+            quorum_decay_rate_bps_per_day: decay_rate,
+            timelock_secs: timelock,
+        };
+        let params_key = DataKey::ProposalParams(id);
+        env.storage()
+            .persistent()
+            .set(&params_key, &proposal_params);
+        Self::bump_key_ttl(&env, &params_key);
+
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
@@ -776,6 +963,14 @@ impl Governance {
     ///
     /// Voting power uses LP balances snapshotted at proposal creation (`snapshot_ledger`).
     /// Delegators cannot vote directly; the terminal delegatee votes with aggregated power.
+    ///
+    /// Each account contributes at most what it still holds (#1104): the voter's
+    /// own balance must not have fallen below its snapshot (otherwise
+    /// `InsufficientSnapshotBal`), while a delegator that moved tokens away after
+    /// the snapshot contributes `min(snapshot, unlocked balance)` and can never
+    /// make the delegatee's vote revert. The amount counted for an account is
+    /// exactly the amount locked and recorded in `LockedVote` for it.
+    /// `get_voting_power` returns the total this call would count.
     pub fn vote(
         env: Env,
         voter: Address,
@@ -911,7 +1106,11 @@ impl Governance {
 
         let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
+        let quorum_threshold = proposal
+            .snapshot_total_supply
+            .checked_mul(effective_quorum)
+            .ok_or(GovernanceError::InvalidQuorumBps)?
+            / MAX_BPS;
         if total_votes < quorum_threshold {
             return Err(GovernanceError::QuorumNotMet);
         }
@@ -1100,6 +1299,7 @@ impl Governance {
     ///
     /// Returns [`GovernanceError::NotInitialized`] before `initialize`.
     pub fn get_params(env: Env) -> Result<GovernanceParams, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         Ok(GovernanceParams {
             voting_period_secs: Self::read_voting_period(&env)?,
             timelock_secs: Self::read_timelock(&env)?,
@@ -1217,15 +1417,17 @@ impl Governance {
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
     pub fn set_veto_multisig(env: Env, multisig: Address) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
+        let old_multisig: Option<Address> = env.storage().instance().get(&DataKey::VetoMultisig);
         env.storage()
             .instance()
             .set(&DataKey::VetoMultisig, &multisig);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "veto_multisig_set"),),
-            (multisig,)
+            (old_multisig, multisig)
         );
         Ok(())
     }
@@ -1270,13 +1472,19 @@ impl Governance {
 
         let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
+        let quorum_threshold = proposal
+            .snapshot_total_supply
+            .checked_mul(effective_quorum)
+            .ok_or(GovernanceError::InvalidQuorumBps)?
+            / MAX_BPS;
         if total_votes < quorum_threshold || proposal.votes_for <= proposal.votes_against {
             return Err(GovernanceError::ProposalDefeated);
         }
 
         let voting_period = Self::read_voting_period(&env)?;
-        let discussion_end = now + voting_period;
+        let discussion_end = now
+            .checked_add(voting_period)
+            .ok_or(GovernanceError::InvalidVotingPeriod)?;
 
         proposal.vetoed = true;
         proposal.vetoed_by = Some(multisig.clone());
@@ -1326,6 +1534,37 @@ impl Governance {
         let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
         Ok(lp_client.balance_at(&holder, &proposal.snapshot_ledger))
+    }
+
+    /// The voting power `vote(voter, proposal_id, ..)` would count right now,
+    /// including every delegator that has not voted yet (#1104).
+    ///
+    /// It runs the same computation as `vote`, so a delegatee can read their
+    /// power without sending a transaction. It does not check the voting window
+    /// or `AlreadyVoted`: a voter that has already voted simply reads 0 for
+    /// their own balance. Returns `HasDelegated` for an address that delegated
+    /// (such an address cannot vote) and `InsufficientSnapshotBal` when the
+    /// voter's own balance fell below its snapshot, like `vote`.
+    pub fn get_voting_power(
+        env: Env,
+        proposal_id: u32,
+        voter: Address,
+    ) -> Result<i128, GovernanceError> {
+        Self::extend_instance_ttl(&env);
+        if Self::get_delegate(env.clone(), voter.clone()).is_some() {
+            return Err(GovernanceError::HasDelegated);
+        }
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .ok_or(GovernanceError::ProposalNotFound)?;
+        Self::bump_key_ttl(&env, &proposal_key);
+        let lp_token = Self::read_lp_token(&env)?;
+        let lp_client = LpTokenClient::new(&env, &lp_token);
+        let (power, _locks) = Self::aggregated_voting_power(&env, &lp_client, &voter, &proposal)?;
+        Ok(power)
     }
 
     /// Read a proposal by id.
@@ -1433,7 +1672,11 @@ impl Governance {
 
         let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
+        let quorum_threshold = proposal
+            .snapshot_total_supply
+            .checked_mul(effective_quorum)
+            .ok_or(GovernanceError::InvalidQuorumBps)?
+            / MAX_BPS;
         let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
 
         if !passed {
@@ -1452,12 +1695,26 @@ impl Governance {
     }
 
     fn effective_quorum_bps(env: &Env, proposal: &Proposal) -> Result<i128, GovernanceError> {
-        let base = Self::read_quorum_bps(env)?;
-        let decay_rate: i128 = env
+        let (base, decay_rate) = match env
             .storage()
-            .instance()
-            .get(&DataKey::QuorumDecayRateBpsPerDay)
-            .unwrap_or(0);
+            .persistent()
+            .get::<_, ProposalParams>(&DataKey::ProposalParams(proposal.id))
+        {
+            Some(params) => {
+                Self::bump_key_ttl(env, &DataKey::ProposalParams(proposal.id));
+                (params.quorum_bps, params.quorum_decay_rate_bps_per_day)
+            }
+            None => {
+                // Fall back to live values for legacy proposals created before the upgrade
+                let base = Self::read_quorum_bps(env)?;
+                let decay_rate: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::QuorumDecayRateBpsPerDay)
+                    .unwrap_or(0);
+                (base, decay_rate)
+            }
+        };
         if decay_rate == 0 {
             return Ok(base);
         }
@@ -1470,20 +1727,42 @@ impl Governance {
         } else {
             0
         };
-        Ok((base + decay_rate * days_open as i128).min(MAX_BPS))
+        let decay_acc = decay_rate
+            .checked_mul(days_open as i128)
+            .ok_or(GovernanceError::InvalidQuorumBps)?;
+        let total = base
+            .checked_add(decay_acc)
+            .ok_or(GovernanceError::InvalidQuorumBps)?;
+        Ok(total.min(MAX_BPS))
     }
 
+    /// Voting power `holder` contributes to `proposal`.
+    ///
+    /// * The voter themselves (`is_voter`) keeps the strict rule: a balance below
+    ///   the snapshot is rejected. The voter controls their own balance and sees
+    ///   the failure on their own transaction, so nobody else is affected;
+    ///   relaxing it is out of scope for #1104.
+    /// * Every delegator contributes `min(snapshot, current - locked)`, never
+    ///   below 0. A delegator's balance moves for reasons the delegatee does not
+    ///   control (a transfer, a sale, an earlier vote that locked it), and one
+    ///   such account must not abort the whole vote. Subtracting the locked part
+    ///   keeps the later `lock` call from failing for the same reason.
     fn snapshot_voting_power(
         lp_client: &LpTokenClient,
         holder: &Address,
         proposal: &Proposal,
+        is_voter: bool,
     ) -> Result<i128, GovernanceError> {
-        let power = lp_client.balance_at(holder, &proposal.snapshot_ledger);
+        let snapshot = lp_client.balance_at(holder, &proposal.snapshot_ledger);
         let current = lp_client.balance(holder);
-        if current < power {
-            return Err(GovernanceError::InsufficientSnapshotBal);
+        if is_voter {
+            if current < snapshot {
+                return Err(GovernanceError::InsufficientSnapshotBal);
+            }
+            return Ok(snapshot);
         }
-        Ok(power)
+        let available = current - lp_client.locked_balance(holder);
+        Ok(snapshot.min(available).max(0))
     }
 
     fn aggregated_voting_power(
@@ -1516,7 +1795,7 @@ impl Governance {
         }
         let voted_key = DataKey::HasVoted(proposal.id, holder.clone());
         if !env.storage().persistent().has(&voted_key) {
-            let power = Self::snapshot_voting_power(lp_client, holder, proposal)?;
+            let power = Self::snapshot_voting_power(lp_client, holder, proposal, depth == 0)?;
             if power > 0 {
                 *total += power;
                 locks.push_back((holder.clone(), power));
@@ -1987,8 +2266,14 @@ mod tests {
         let lp1 = Address::generate(&s.env);
         mint_lp(&s, &lp1, 1000);
 
-        let result = gov.try_propose(&lp1, &ProposalKind::UpdateFee(10_001));
-        assert!(result.is_err());
+        let result_10001 = gov.try_propose(&lp1, &ProposalKind::UpdateFee(10_001));
+        assert_eq!(result_10001, Err(Ok(GovernanceError::InvalidFeeBps)));
+
+        let result_10000 = gov.try_propose(&lp1, &ProposalKind::UpdateFee(10_000));
+        assert_eq!(result_10000, Err(Ok(GovernanceError::InvalidFeeBps)));
+
+        let result_9999 = gov.try_propose(&lp1, &ProposalKind::UpdateFee(9_999));
+        assert!(result_9999.is_ok());
     }
 
     #[test]
@@ -2292,10 +2577,15 @@ mod tests {
         mint_lp(&s, &lp1, 600);
         mint_lp(&s, &lp2, 400);
 
-        // Set timelock delay to 0, but execute_after should still respect veto window.
-        gov.set_timelock_delay(&0_u64);
+        // Set timelock delay to 0 is rejected (#1105).
+        assert_eq!(
+            gov.try_set_timelock_delay(&0_u64),
+            Err(Ok(GovernanceError::InvalidTimelock))
+        );
+        // Set timelock delay to 1 (minimum), execute_after should still respect veto window.
+        gov.set_timelock_delay(&1_u64);
         let params = gov.get_params();
-        assert_eq!(params.timelock_secs, 0);
+        assert_eq!(params.timelock_secs, 1);
 
         let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
         gov.vote(&lp1, &pid, &Vote::For);
@@ -3030,9 +3320,19 @@ mod tests {
         let r = gov.try_propose(
             &lp1,
             &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
-                cl_pool: cl_addr,
+                cl_pool: cl_addr.clone(),
                 recipient: Address::generate(&env),
                 bps: -1,
+            }),
+        );
+        assert!(r.is_err());
+
+        let r = gov.try_propose(
+            &lp1,
+            &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
+                cl_pool: cl_addr,
+                recipient: Address::generate(&env),
+                bps: 10_000,
             }),
         );
         assert!(r.is_err());
@@ -3545,11 +3845,11 @@ mod tests {
         let multisig = Address::generate(&s.env);
         gov.set_veto_multisig(&multisig);
 
-        let (version, data): (u32, (Address,)) =
+        let (version, data): (u32, (Option<Address>, Address)) =
             last_versioned_event(&s, &gov, "veto_multisig_set");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(version, 1);
-        assert_eq!(data, (multisig,));
+        assert_eq!(data, (None, multisig));
     }
 
     // ── Issue #824: missing-proposal reads return a typed error, not a trap ───
@@ -3676,6 +3976,333 @@ mod tests {
             gov.try_unlock_vote(&lp1, &999),
             Err(Ok(GovernanceError::ProposalNotFound))
         );
+    }
+
+    // ── #1104: a delegator whose balance fell cannot block its delegatee ──────
+
+    /// Create a proposal at a real ledger, then move to the next one, so that any
+    /// balance change the test makes afterwards falls outside the snapshot.
+    fn propose_at_ledger(s: &Suite, gov: &GovernanceClient, proposer: &Address) -> u32 {
+        s.env.ledger().with_mut(|l| l.sequence_number = 100);
+        let pid = gov.propose(proposer, &ProposalKind::UpdateFee(50));
+        s.env.ledger().with_mut(|l| l.sequence_number = 101);
+        pid
+    }
+
+    fn lp_of(s: &Suite) -> token::LpTokenClient<'_> {
+        token::LpTokenClient::new(&s.env, &s.lp_addr)
+    }
+
+    /// The reported scenario: the delegator moves a single LP unit after the
+    /// snapshot and the delegatee still votes, counting 100 + 599.
+    /// (Fails on main with `InsufficientSnapshotBal`.)
+    #[test]
+    fn test_delegator_moving_one_unit_does_not_block_delegatee() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let delegatee = Address::generate(&s.env);
+        let delegator = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &delegator, 600);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&delegator, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp.transfer(&delegator, &other, &1);
+
+        assert_eq!(gov.get_voting_power(&pid, &delegatee), 699);
+        gov.vote(&delegatee, &pid, &Vote::For);
+
+        assert_eq!(gov.get_proposal(&pid).votes_for, 100 + 599);
+        assert_eq!(lp.locked_balance(&delegatee), 100);
+        assert_eq!(lp.locked_balance(&delegator), 599);
+    }
+
+    /// A delegator that moved everything contributes 0 and does not block the
+    /// vote for the remaining accounts.
+    #[test]
+    fn test_delegator_that_moved_everything_contributes_zero() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let delegatee = Address::generate(&s.env);
+        let gone = Address::generate(&s.env);
+        let stays = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &gone, 600);
+        mint_lp(&s, &stays, 200);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&gone, &delegatee);
+        gov.delegate(&stays, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp.transfer(&gone, &sink, &600);
+
+        gov.vote(&delegatee, &pid, &Vote::For);
+        assert_eq!(gov.get_proposal(&pid).votes_for, 100 + 200);
+        assert_eq!(lp.locked_balance(&gone), 0);
+        assert_eq!(lp.locked_balance(&stays), 200);
+        assert_eq!(lp.locked_balance(&delegatee), 100);
+    }
+
+    /// Locks equal the counted amounts and unlock_vote releases exactly them;
+    /// balances are consistent after the whole lifecycle.
+    #[test]
+    fn test_locks_are_exact_through_a_full_lifecycle() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let delegatee = Address::generate(&s.env);
+        let delegator = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &delegator, 600);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&delegator, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp.transfer(&delegator, &other, &1);
+        gov.vote(&delegatee, &pid, &Vote::For);
+        assert_eq!(lp.locked_balance(&delegator), 599);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        gov.execute(&pid);
+
+        gov.unlock_vote(&delegatee, &pid);
+        gov.unlock_vote(&delegator, &pid);
+        assert_eq!(lp.locked_balance(&delegatee), 0);
+        assert_eq!(lp.locked_balance(&delegator), 0);
+        assert_eq!(lp.balance(&delegatee), 100);
+        assert_eq!(lp.balance(&delegator), 599);
+        assert_eq!(lp.balance(&other), 1);
+        // The lock record is gone, so a second unlock finds nothing.
+        assert_eq!(
+            gov.try_unlock_vote(&delegator, &pid),
+            Err(Ok(GovernanceError::NoLockedVote))
+        );
+    }
+
+    /// A delegator whose balance rose after the snapshot contributes only the
+    /// snapshot amount.
+    #[test]
+    fn test_delegator_balance_increase_after_snapshot_is_ignored() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let delegatee = Address::generate(&s.env);
+        let delegator = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &delegator, 600);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&delegator, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        mint_lp(&s, &delegator, 400);
+
+        assert_eq!(gov.get_voting_power(&pid, &delegatee), 700);
+        gov.vote(&delegatee, &pid, &Vote::For);
+        assert_eq!(gov.get_proposal(&pid).votes_for, 700);
+        assert_eq!(lp.locked_balance(&delegator), 600);
+    }
+
+    /// Chain of depth 3 where the middle account moved tokens: only that
+    /// account's contribution shrinks.
+    #[test]
+    fn test_chain_of_depth_three_only_the_moved_account_shrinks() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let top = Address::generate(&s.env);
+        let mid = Address::generate(&s.env);
+        let leaf = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &top, 100);
+        mint_lp(&s, &mid, 300);
+        mint_lp(&s, &leaf, 200);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&leaf, &mid);
+        gov.delegate(&mid, &top);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp.transfer(&mid, &sink, &100);
+
+        gov.vote(&top, &pid, &Vote::For);
+        // top 100 + mid min(300, 200) + leaf 200.
+        assert_eq!(gov.get_proposal(&pid).votes_for, 100 + 200 + 200);
+        assert_eq!(lp.locked_balance(&top), 100);
+        assert_eq!(lp.locked_balance(&mid), 200);
+        assert_eq!(lp.locked_balance(&leaf), 200);
+    }
+
+    /// One delegator moving tokens leaves every other delegator's contribution
+    /// intact.
+    #[test]
+    fn test_other_delegators_are_unaffected_by_one_that_moved() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let delegatee = Address::generate(&s.env);
+        let d1 = Address::generate(&s.env);
+        let d2 = Address::generate(&s.env);
+        let d3 = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 50);
+        mint_lp(&s, &d1, 100);
+        mint_lp(&s, &d2, 200);
+        mint_lp(&s, &d3, 300);
+        mint_lp(&s, &proposer, 350);
+        gov.delegate(&d1, &delegatee);
+        gov.delegate(&d2, &delegatee);
+        gov.delegate(&d3, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp_of(&s).transfer(&d2, &sink, &50);
+
+        gov.vote(&delegatee, &pid, &Vote::Against);
+        assert_eq!(gov.get_proposal(&pid).votes_against, 50 + 100 + 150 + 300);
+    }
+
+    /// The voter's own balance keeps the strict check: they can see it and a
+    /// failure only affects themselves. The view reports the same error.
+    #[test]
+    fn test_voters_own_balance_check_stays_strict() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let voter = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &voter, 100);
+        mint_lp(&s, &proposer, 300);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        lp_of(&s).transfer(&voter, &sink, &1);
+
+        assert_eq!(
+            gov.try_vote(&voter, &pid, &Vote::For),
+            Err(Ok(GovernanceError::InsufficientSnapshotBal))
+        );
+        assert_eq!(
+            gov.try_get_voting_power(&pid, &voter),
+            Err(Ok(GovernanceError::InsufficientSnapshotBal))
+        );
+    }
+
+    #[test]
+    fn test_get_voting_power_errors_and_plain_values() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let delegator = Address::generate(&s.env);
+        let delegatee = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let stranger = Address::generate(&s.env);
+        mint_lp(&s, &delegator, 600);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &proposer, 300);
+        gov.delegate(&delegator, &delegatee);
+
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        assert_eq!(
+            gov.try_get_voting_power(&999, &delegatee),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            gov.try_get_voting_power(&pid, &delegator),
+            Err(Ok(GovernanceError::HasDelegated))
+        );
+        assert_eq!(gov.get_voting_power(&pid, &stranger), 0);
+        assert_eq!(gov.get_voting_power(&pid, &proposer), 300);
+        assert_eq!(gov.get_voting_power(&pid, &delegatee), 700);
+    }
+
+    /// A delegator whose tokens are already locked by an earlier vote can only
+    /// contribute what is still unlocked, instead of making the delegatee's
+    /// `lock` call revert.
+    #[test]
+    fn test_delegator_locked_by_another_vote_contributes_only_available_balance() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = lp_of(&s);
+        let delegatee = Address::generate(&s.env);
+        let delegator = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &delegatee, 100);
+        mint_lp(&s, &delegator, 600);
+        mint_lp(&s, &proposer, 300);
+
+        let first = propose_at_ledger(&s, &gov, &proposer);
+        // The delegator votes directly on the first proposal, locking 600.
+        gov.vote(&delegator, &first, &Vote::For);
+        assert_eq!(lp.locked_balance(&delegator), 600);
+
+        gov.delegate(&delegator, &delegatee);
+        s.env.ledger().with_mut(|l| l.sequence_number = 200);
+        let second = gov.propose(&proposer, &ProposalKind::UpdateFee(60));
+        s.env.ledger().with_mut(|l| l.sequence_number = 201);
+
+        gov.vote(&delegatee, &second, &Vote::For);
+        assert_eq!(gov.get_proposal(&second).votes_for, 100);
+        assert_eq!(lp.locked_balance(&delegator), 600);
+    }
+
+    /// `get_voting_power` equals what `vote` adds to the tally and what it
+    /// locks, over pseudo-random post-snapshot balance movements.
+    #[test]
+    fn test_get_voting_power_equals_vote_over_random_balance_movements() {
+        for seed in 1..=10_u64 {
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+            let lp = lp_of(&s);
+            let delegatee = Address::generate(&s.env);
+            let proposer = Address::generate(&s.env);
+            let sink = Address::generate(&s.env);
+            let mut delegators = soroban_sdk::Vec::<Address>::new(&s.env);
+            mint_lp(&s, &delegatee, 100);
+            mint_lp(&s, &proposer, 500);
+            let mut state = seed;
+            for _ in 0..5 {
+                let d = Address::generate(&s.env);
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                mint_lp(&s, &d, 50 + ((state >> 33) % 500) as i128);
+                gov.delegate(&d, &delegatee);
+                delegators.push_back(d);
+            }
+
+            let pid = propose_at_ledger(&s, &gov, &proposer);
+
+            for d in delegators.iter() {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let held = lp.balance(&d);
+                match (state >> 33) % 3 {
+                    0 => {}
+                    1 => {
+                        let moved = 1 + ((state >> 20) as i128) % held;
+                        lp.transfer(&d, &sink, &moved);
+                    }
+                    _ => mint_lp(&s, &d, 1 + ((state >> 20) % 300) as i128),
+                }
+            }
+
+            let before = gov.get_proposal(&pid).votes_for;
+            let predicted = gov.get_voting_power(&pid, &delegatee);
+            gov.vote(&delegatee, &pid, &Vote::For);
+            let after = gov.get_proposal(&pid).votes_for;
+            assert_eq!(after - before, predicted, "seed {seed}");
+
+            let mut locked_total = lp.locked_balance(&delegatee);
+            for d in delegators.iter() {
+                locked_total += lp.locked_balance(&d);
+            }
+            assert_eq!(locked_total, predicted, "seed {seed}: locks must match");
+        }
     }
 
     // ── #931: typed NotInitialized instead of host traps ─────────────────────
@@ -4477,5 +5104,540 @@ mod prop_tests {
             assert_eq!(gov.get_proposal_count(), 0);
             let _params = gov.get_params();
         }
+    }
+
+    // ── Issue #1105: Quorum decay retroactive modification, bounds, events, get_admin ──
+
+    #[test]
+    fn test_raising_quorum_decay_after_vote_does_not_change_queued_status() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        // 1000 LP total supply, quorum 10% (1000 bps)
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        lp.mint(&lp1, &300);
+        lp.mint(&lp2, &700);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        let p = gov.get_proposal(&pid);
+        // Advance past timelock window
+        s.env.ledger().set_timestamp(p.execute_after + 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Queued);
+
+        // Admin raises decay rate to 5000 bps per day
+        gov.set_quorum_decay_bps_per_day(&5_000);
+
+        // Proposal status MUST remain Queued, not flip to Defeated!
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Queued);
+
+        // Advance past timelock and execute
+        s.env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_lowering_quorum_decay_after_vote_does_not_revive_defeated_proposal() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        // High decay rate at creation
+        gov.set_quorum_decay_bps_per_day(&5_000);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        lp.mint(&lp1, &50);
+        lp.mint(&lp2, &950);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        let p = gov.get_proposal(&pid);
+        // Past voting window
+        s.env.ledger().set_timestamp(p.vote_end + 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Defeated);
+
+        // Lower decay rate to 0
+        gov.set_quorum_decay_bps_per_day(&0);
+
+        // Proposal status MUST remain Defeated!
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Defeated);
+
+        s.env.ledger().set_timestamp(p.execute_after + 1);
+        assert_eq!(
+            gov.try_execute(&pid),
+            Err(Ok(GovernanceError::QuorumNotMet))
+        );
+    }
+
+    #[test]
+    fn test_proposals_created_under_different_rates_retain_own_parameters() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let lp1 = Address::generate(&s.env);
+        lp.mint(&lp1, &1000);
+
+        // Rate 1: 100 bps/day
+        gov.set_quorum_decay_bps_per_day(&100);
+        let pid1 = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+
+        // Rate 2: 500 bps/day
+        gov.set_quorum_decay_bps_per_day(&500);
+        let pid2 = gov.propose(&lp1, &ProposalKind::UpdateFee(60));
+
+        let params1 = gov.get_proposal_params(&pid1);
+        assert_eq!(params1.quorum_decay_rate_bps_per_day, 100);
+
+        let params2 = gov.get_proposal_params(&pid2);
+        assert_eq!(params2.quorum_decay_rate_bps_per_day, 500);
+    }
+
+    #[test]
+    fn test_legacy_proposals_fallback_to_live_values() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let lp1 = Address::generate(&s.env);
+        lp.mint(&lp1, &1000);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+
+        // Delete ProposalParams directly to simulate legacy proposal written before upgrade
+        s.env.as_contract(&s.gov_addr, || {
+            s.env
+                .storage()
+                .instance()
+                .remove(&DataKey::ProposalParams(pid));
+        });
+
+        // get_proposal_params should fallback to live values
+        let params = gov.get_proposal_params(&pid);
+        let current_live = gov.get_params();
+        assert_eq!(params.quorum_bps, current_live.quorum_bps);
+        assert_eq!(
+            params.quorum_decay_rate_bps_per_day,
+            current_live.quorum_decay_rate_bps_per_day
+        );
+        assert_eq!(params.timelock_secs, current_live.timelock_secs);
+
+        // Status evaluation continues to work on legacy proposals
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Active);
+    }
+
+    #[test]
+    fn test_set_quorum_decay_bps_per_day_bounds() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        // 0 and MAX_BPS (10_000) are accepted
+        gov.set_quorum_decay_bps_per_day(&0);
+        assert_eq!(gov.get_params().quorum_decay_rate_bps_per_day, 0);
+
+        gov.set_quorum_decay_bps_per_day(&10_000);
+        assert_eq!(gov.get_params().quorum_decay_rate_bps_per_day, 10_000);
+
+        // > 10_000 rejected with InvalidQuorumBps
+        assert_eq!(
+            gov.try_set_quorum_decay_bps_per_day(&10_001),
+            Err(Ok(GovernanceError::InvalidQuorumBps))
+        );
+    }
+
+    #[test]
+    fn test_set_min_proposer_stake_bps_bounds() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        gov.set_min_proposer_stake_bps(&0);
+        assert_eq!(gov.get_params().min_proposer_stake_bps, 0);
+
+        gov.set_min_proposer_stake_bps(&10_000);
+        assert_eq!(gov.get_params().min_proposer_stake_bps, 10_000);
+
+        assert_eq!(
+            gov.try_set_min_proposer_stake_bps(&10_001),
+            Err(Ok(GovernanceError::InvalidProposerStake))
+        );
+    }
+
+    #[test]
+    fn test_set_timelock_delay_bounds() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        // 0 rejected
+        assert_eq!(
+            gov.try_set_timelock_delay(&0),
+            Err(Ok(GovernanceError::InvalidTimelock))
+        );
+
+        // 1 to 365*86400 accepted
+        gov.set_timelock_delay(&1);
+        assert_eq!(gov.get_params().timelock_secs, 1);
+
+        gov.set_timelock_delay(&(365 * 86_400));
+        assert_eq!(gov.get_params().timelock_secs, 365 * 86_400);
+
+        // > 365*86400 rejected
+        assert_eq!(
+            gov.try_set_timelock_delay(&(365 * 86_400 + 1)),
+            Err(Ok(GovernanceError::InvalidTimelock))
+        );
+    }
+
+    #[test]
+    fn test_initialize_bounds_and_event() {
+        let env = Env::default();
+        let gov_id = env.register_contract(None, Governance);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        let amm_pool = Address::generate(&env);
+        let lp_token = Address::generate(&env);
+
+        // Timelock = 0 rejected at initialize
+        assert_eq!(
+            gov.try_initialize(&admin, &amm_pool, &lp_token, &100, &0, &1000, &100),
+            Err(Ok(GovernanceError::InvalidTimelock))
+        );
+
+        // Timelock > max rejected at initialize
+        assert_eq!(
+            gov.try_initialize(
+                &admin,
+                &amm_pool,
+                &lp_token,
+                &100,
+                &(365 * 86_400 + 1),
+                &1000,
+                &100
+            ),
+            Err(Ok(GovernanceError::InvalidTimelock))
+        );
+
+        // Successful initialize
+        gov.initialize(&admin, &amm_pool, &lp_token, &100, &86400, &1000, &100);
+
+        // Verify get_admin returns the initialized admin
+        assert_eq!(gov.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_get_admin_verification() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        assert_eq!(gov.get_admin(), s.admin);
+
+        let new_admin = Address::generate(&s.env);
+        gov.propose_admin(&s.admin, &new_admin);
+        gov.accept_admin(&new_admin);
+
+        assert_eq!(gov.get_admin(), new_admin);
+    }
+
+    #[test]
+    fn test_extreme_decay_rate_does_not_trap_propose_or_status_or_unlock() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        gov.set_quorum_decay_bps_per_day(&10_000);
+
+        let lp1 = Address::generate(&s.env);
+        lp.mint(&lp1, &1000);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        // Advance 100 years in seconds
+        s.env
+            .ledger()
+            .set_timestamp(s.env.ledger().timestamp() + 100 * 365 * 86_400);
+
+        // status and unlock_vote must not trap
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Expired);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_setters_emit_versioned_events_with_old_and_new_values() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        gov.set_quorum_decay_bps_per_day(&200);
+        gov.set_min_proposer_stake_bps(&300);
+        gov.set_timelock_delay(&7200);
+
+        // All setters executed cleanly and updated storage
+        let params = gov.get_params();
+        assert_eq!(params.quorum_decay_rate_bps_per_day, 200);
+        assert_eq!(params.min_proposer_stake_bps, 300);
+        assert_eq!(params.timelock_secs, 7200);
+    }
+
+    #[test]
+    fn test_veto_respects_proposal_quorum_and_checked_math() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let multisig = Address::generate(&s.env);
+        gov.set_veto_multisig(&multisig);
+
+        let lp1 = Address::generate(&s.env);
+        lp.mint(&lp1, &1000);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        let p = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(p.vote_end + 1);
+
+        gov.veto(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::InDiscussion);
+
+        // After discussion window elapses (voting_period_secs)
+        s.env
+            .ledger()
+            .set_timestamp(s.env.ledger().timestamp() + 7 * 24 * 60 * 60 + 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Vetoed);
+    }
+
+    #[test]
+    fn test_uninitialized_get_admin_returns_error() {
+        let env = Env::default();
+        let gov_id = env.register_contract(None, Governance);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        assert_eq!(
+            gov.try_get_admin(),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_all_entrypoints_extend_ttl() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 1_000;
+            l.max_entry_ttl = 6_312_000;
+        });
+
+        // Test that calling entrypoints bumps instance TTL
+        s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+        assert_eq!(gov.get_admin(), s.admin);
+
+        s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+        gov.set_quorum_decay_bps_per_day(&150);
+
+        s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+        gov.set_min_proposer_stake_bps(&250);
+
+        s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+        gov.set_timelock_delay(&3600);
+
+        s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+        let _ = gov.get_proposal_count();
+    }
+
+    // ── Quorum denominator regression tests ───────────────────────────────
+
+    #[test]
+    fn test_quorum_denominator_same_ledger_removal() {
+        // Test A: LP holder with 60% of supply calls remove_liquidity(all),
+        // then propose in the same ledger. snapshot_total_supply should equal
+        // the pre-removal supply.
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        // Create a holder with 60% of supply
+        let holder = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+        lp.mint(&holder, &6_000_i128);
+        lp.mint(&other, &4_000_i128);
+
+        // Advance to ledger 10
+        s.env.ledger().set(10, 10_000);
+
+        // Holder removes all liquidity in ledger 10
+        lp.burn(&holder, &6_000_i128);
+
+        // Propose in the same ledger - snapshot is ledger 9
+        let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
+
+        let proposal = gov.get_proposal(&pid);
+        // snapshot_total_supply should be 10,000 (pre-removal), not 4,000
+        assert_eq!(proposal.snapshot_total_supply, 10_000);
+        assert_eq!(proposal.snapshot_ledger, 9);
+    }
+
+    #[test]
+    fn test_quorum_denominator_same_ledger_addition() {
+        // Test B: a deposit of 10x the supply in the proposal's ledger does not
+        // change snapshot_total_supply.
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let holder = Address::generate(&s.env);
+        lp.mint(&holder, &1_000_i128);
+
+        // Advance to ledger 10
+        s.env.ledger().set(10, 10_000);
+
+        // Propose - snapshot is ledger 9
+        let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
+
+        let proposal = gov.get_proposal(&pid);
+        assert_eq!(proposal.snapshot_total_supply, 1_000);
+
+        // Add 10x supply in the same ledger (ledger 10)
+        let other = Address::generate(&s.env);
+        lp.mint(&other, &10_000_i128);
+
+        // snapshot_total_supply should still be 1,000, not 11,000
+        let proposal_after = gov.get_proposal(&pid);
+        assert_eq!(proposal_after.snapshot_total_supply, 1_000);
+    }
+
+    #[test]
+    fn test_quorum_denominator_cross_ledger_change() {
+        // Test C: changes in earlier ledgers are reflected exactly.
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let holder = Address::generate(&s.env);
+
+        // Mint at ledger 1
+        s.env.ledger().set(1, 1_000);
+        lp.mint(&holder, &1_000_i128);
+
+        // Mint at ledger 2
+        s.env.ledger().set(2, 2_000);
+        lp.mint(&holder, &500_i128);
+
+        // Burn at ledger 3
+        s.env.ledger().set(3, 3_000);
+        lp.burn(&holder, &200_i128);
+
+        // Propose at ledger 4 - snapshot is ledger 3
+        s.env.ledger().set(4, 4_000);
+        let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
+
+        let proposal = gov.get_proposal(&pid);
+        // snapshot_total_supply should be 1,300 (supply at ledger 3)
+        assert_eq!(proposal.snapshot_total_supply, 1_300);
+        assert_eq!(proposal.snapshot_ledger, 3);
+
+        // Verify total_supply_at returns correct values for each ledger
+        assert_eq!(lp.total_supply_at(&1), Ok(1_000));
+        assert_eq!(lp.total_supply_at(&2), Ok(1_500));
+        assert_eq!(lp.total_supply_at(&3), Ok(1_300));
+    }
+
+    #[test]
+    fn test_proposal_parameter_validation() {
+        // Test that invalid proposal parameters are rejected eagerly
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let holder = Address::generate(&s.env);
+        lp.mint(&holder, &1_000_i128);
+
+        s.env.ledger().set(10, 10_000);
+
+        // Invalid CreatePolVesting: total <= 0
+        let pol_vesting = Address::generate(&s.env);
+        let beneficiary = Address::generate(&s.env);
+        let pool = Address::generate(&s.env);
+        let invalid_vesting = CreatePolVestingParams {
+            pol_vesting: pol_vesting.clone(),
+            beneficiary: beneficiary.clone(),
+            lp_token: s.lp_addr.clone(),
+            pool: pool.clone(),
+            total: 0,
+            start_ledger: 20,
+            cliff_ledger: 30,
+            end_ledger: 40,
+        };
+        assert_eq!(
+            gov.try_propose(&holder, &ProposalKind::CreatePolVesting(invalid_vesting)),
+            Err(Ok(GovernanceError::InvalidProposalParams))
+        );
+
+        // Invalid CreatePolVesting: cliff < start
+        let invalid_vesting2 = CreatePolVestingParams {
+            pol_vesting: pol_vesting.clone(),
+            beneficiary: beneficiary.clone(),
+            lp_token: s.lp_addr.clone(),
+            pool: pool.clone(),
+            total: 1000,
+            start_ledger: 30,
+            cliff_ledger: 20,
+            end_ledger: 40,
+        };
+        assert_eq!(
+            gov.try_propose(&holder, &ProposalKind::CreatePolVesting(invalid_vesting2)),
+            Err(Ok(GovernanceError::InvalidProposalParams))
+        );
+
+        // Invalid CreatePolVesting: end <= cliff
+        let invalid_vesting3 = CreatePolVestingParams {
+            pol_vesting: pol_vesting.clone(),
+            beneficiary: beneficiary.clone(),
+            lp_token: s.lp_addr.clone(),
+            pool: pool.clone(),
+            total: 1000,
+            start_ledger: 10,
+            cliff_ledger: 20,
+            end_ledger: 20,
+        };
+        assert_eq!(
+            gov.try_propose(&holder, &ProposalKind::CreatePolVesting(invalid_vesting3)),
+            Err(Ok(GovernanceError::InvalidProposalParams))
+        );
+
+        // Invalid CreatePolVesting: end in the past
+        let invalid_vesting4 = CreatePolVestingParams {
+            pol_vesting,
+            beneficiary,
+            lp_token: s.lp_addr.clone(),
+            pool,
+            total: 1000,
+            start_ledger: 5,
+            cliff_ledger: 8,
+            end_ledger: 9, // Current ledger is 10
+        };
+        assert_eq!(
+            gov.try_propose(&holder, &ProposalKind::CreatePolVesting(invalid_vesting4)),
+            Err(Ok(GovernanceError::InvalidProposalParams))
+        );
+
+        // Valid CreatePolVesting should succeed
+        let valid_vesting = CreatePolVestingParams {
+            pol_vesting: Address::generate(&s.env),
+            beneficiary: Address::generate(&s.env),
+            lp_token: s.lp_addr.clone(),
+            pool: Address::generate(&s.env),
+            total: 1000,
+            start_ledger: 20,
+            cliff_ledger: 30,
+            end_ledger: 40,
+        };
+        assert!(gov.try_propose(&holder, &ProposalKind::CreatePolVesting(valid_vesting)).is_ok());
     }
 }

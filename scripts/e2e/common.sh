@@ -194,20 +194,14 @@ assert_not_contains() {
 
 # invoke_as ACCOUNT CONTRACT_ID FN ARGS... — invoke with a different signer.
 #
-# Two transient failures get one more attempt:
+# Simulation failing gets one more attempt:
 #
-# - Simulation failing. The public RPC endpoint is load-balanced, and the node
+# - The public RPC endpoint is load-balanced, and the node
 #   that simulates can be a ledger behind the one that confirmed the caller's
 #   previous transaction, so a call that spends what that transaction minted
 #   sees the old balance. The retry waits a ledger first. A genuine failure
 #   fails again; expect_fail turns this off (E2E_SIM_RETRY=0) so negative
 #   checks don't pay for the wait.
-# - ResourceLimitExceeded on submit. The token contract appends a balance checkpoint the first time an
-# account's balance changes in a ledger and overwrites it on later changes in
-# the same ledger, so a call simulated on the ledger that just applied the
-# account's previous transfer is budgeted for the overwrite, runs one ledger
-# later as an append, and writes more bytes than it declared. The rejected
-# transaction changes no state, and the new simulation runs on a later ledger.
 invoke_as() {
   local account="$1"
   local contract_id="$2"
@@ -225,11 +219,13 @@ invoke_as() {
     if [[ "$rc" -eq 0 || "$attempt" -eq 2 ]]; then
       break
     fi
-    if grep -q 'ResourceLimitExceeded' "$err"; then
-      printf '[retry] %s rejected with ResourceLimitExceeded; simulating and sending again\n' "$1" >&2
-    elif [[ "${E2E_SIM_RETRY:-1}" == "1" ]] && grep -q 'transaction simulation failed' "$err"; then
+    if [[ "${E2E_SIM_RETRY:-1}" == "1" ]] && grep -q 'transaction simulation failed' "$err"; then
       printf '[retry] %s simulation failed; waiting a ledger in case the RPC node lags, then retrying\n' "$1" >&2
       sleep 6
+    elif grep -q 'Account not found' "$err"; then
+      # Rejected before submission, so repeating it cannot apply twice.
+      printf '[retry] %s: RPC node has not seen the account yet; waiting, then retrying\n' "$1" >&2
+      sleep 10
     else
       break
     fi
@@ -284,14 +280,40 @@ e2e_wasm() {
   printf '%s' "$path"
 }
 
+# e2e_retry LABEL CMD... — run CMD and print its output. A transient RPC
+# failure (an account the node has not seen yet, a timeout, or a 429/5xx) is
+# retried up to six times with a growing wait. Only use it for calls that are
+# safe to repeat: uploads, and deploys of fresh instances.
+e2e_retry() {
+  local label="$1" out rc attempt
+  local max_attempts=6
+  shift
+  for attempt in $(seq 1 "$max_attempts"); do
+    rc=0
+    out=$("$@" 2>&1) || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    # A here-string rather than a pipe: under pipefail, grep -q exiting early
+    # can make the printf on the left look like a failure.
+    if [[ "$attempt" -eq "$max_attempts" ]] || ! grep -qE 'Account not found|Request timeout|timed out|SendRequest|client error|rejected `?(429|50[0-9])|\b(429|50[234])\b' <<<"$out"; then
+      printf '%s\n' "$out"
+      return "$rc"
+    fi
+    printf '[retry] %s: transient RPC failure (attempt %s of %s); waiting before retrying\n' "$label" "$attempt" "$max_attempts" >&2
+    sleep $(( attempt * 10 ))
+  done
+}
+
 # e2e_deploy NAME — deploy a fresh instance of contract NAME, print its id.
 e2e_deploy() {
   local wasm out id
   wasm=$(e2e_wasm "$1")
-  out=$(stellar contract deploy \
+  out=$(e2e_retry "deploy of $1" stellar contract deploy \
     --wasm "$wasm" \
     --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" 2>&1) || die "deploy of $1 failed: $out"
+    --source "$SOURCE_ACCOUNT") || die "deploy of $1 failed: $out"
   id=$(printf '%s\n' "$out" | extract_contract_id)
   if [[ -z "$id" ]]; then
     die "could not parse contract id from deploy of $1: $out"
@@ -303,10 +325,10 @@ e2e_deploy() {
 e2e_upload() {
   local wasm out hash
   wasm=$(e2e_wasm "$1")
-  out=$(stellar contract upload \
+  out=$(e2e_retry "upload of $1" stellar contract upload \
     --wasm "$wasm" \
     --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" 2>&1) || die "upload of $1 failed: $out"
+    --source "$SOURCE_ACCOUNT") || die "upload of $1 failed: $out"
   hash=$(printf '%s\n' "$out" | grep -Eo '[0-9a-fA-F]{64}' | tail -n 1)
   if [[ -z "$hash" ]]; then
     die "could not parse wasm hash from upload of $1: $out"
